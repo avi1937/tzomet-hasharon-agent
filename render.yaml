@@ -1,0 +1,36 @@
+services:
+  - type: cron
+    name: tzomet-hasharon-agent-hourly
+    runtime: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python agent.py hourly"
+    schedule: "0 * * * *"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: MIN_SCORE
+        value: "6"
+      - key: MAX_ITEMS_PER_RUN
+        value: "20"
+      - key: MAX_QUERIES_PER_RUN
+        value: "140"
+      - key: GOOGLE_NEWS_DAYS_BACK
+        value: "2"
+      - key: SEND_EMPTY_REPORT
+        value: "false"
+
+  - type: cron
+    name: tzomet-hasharon-agent-daily
+    runtime: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python agent.py daily"
+    schedule: "55 20 * * *"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
