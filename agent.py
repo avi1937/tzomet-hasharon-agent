@@ -140,7 +140,7 @@ BROAD_TERMS = list(dict.fromkeys(
 
 
 # =====================
-# URL NORMALIZATION  ← חדש בV5
+# URL NORMALIZATION  ← שלב 2
 # =====================
 
 TRACKING_PARAMS = {
@@ -162,7 +162,7 @@ def normalize_url(url):
             parsed.path.rstrip("/"),
             parsed.params,
             clean_query,
-            ""  # בלי fragment (#)
+            ""
         ))
         return clean
     except Exception:
@@ -188,7 +188,6 @@ def hits(text, terms):
     return list(dict.fromkeys([t for t in terms if contains(text, t)]))
 
 def uid(title, link):
-    # ← חדש: משתמש ב-URL מנוקה
     return hashlib.sha256((title + "|" + normalize_url(link)).encode("utf-8")).hexdigest()
 
 def quote(term):
@@ -213,7 +212,28 @@ def source_from_title(title):
 
 
 # =====================
-# DATE FILTERING  ← חדש בV5
+# TITLE DEDUPLICATION  ← שלב 3
+# =====================
+
+def title_similarity(a, b):
+    """מחזיר אחוז דמיון בין שתי כותרות (0.0 עד 1.0)."""
+    a_words = set(norm(a).split())
+    b_words = set(norm(b).split())
+    if not a_words or not b_words:
+        return 0.0
+    shared = a_words & b_words
+    return len(shared) / max(len(a_words), len(b_words))
+
+def is_duplicate_title(title, seen_titles, threshold=0.9):
+    """בודק אם הכותרת דומה מדי לכותרת שכבר ראינו."""
+    for seen in seen_titles:
+        if title_similarity(title, seen) >= threshold:
+            return True
+    return False
+
+
+# =====================
+# DATE FILTERING  ← שלב 1
 # =====================
 
 def parse_date(entry):
@@ -329,7 +349,7 @@ def fetch(query):
 
         items.append({
             "title": title,
-            "link": normalize_url(link),  # ← חדש: שומרים URL מנוקה
+            "link": normalize_url(link),
             "published": published,
             "source": source_from_title(title),
             "query": query
@@ -496,6 +516,7 @@ def daily_message(conn):
 def run_hourly():
     conn = db()
     candidates = {}
+    seen_titles = []  # ← שלב 3: לזכור כותרות שכבר ראינו
 
     stats = {
         "scanned": 0,
@@ -527,8 +548,14 @@ def run_hourly():
                 stats["skipped_duplicate"] += 1
                 continue
 
+            # ← שלב 3: בדיקת דמיון כותרות
+            if is_duplicate_title(item["title"], seen_titles):
+                stats["skipped_duplicate"] += 1
+                continue
+
             if item["id"] not in candidates or item["score"] > candidates[item["id"]]["score"]:
                 candidates[item["id"]] = item
+                seen_titles.append(item["title"])
 
         time.sleep(0.12)
 
