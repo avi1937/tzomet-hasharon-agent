@@ -117,7 +117,6 @@ TOPICS = [
     "מרוץ", "הופעה", "סגירת כבישים", "מכרז", "תקציב עירוני", "סייל"
 ]
 
-# ← חדש שלב 4: נושאי אירועים
 CULTURE_EVENTS = [
     "הופעה", "מופע", "תיאטרון", "הרצאה", "פסטיבל", "תערוכה",
     "סיור מודרך", "קונצרט", "סטנדאפ", "קומדיה", "מחול", "אופרה",
@@ -150,6 +149,27 @@ NATIONAL_SITES = [
 
 LOCAL_SITES = [
     "tzomet-hrz.co.il", "hasharon-post.co.il", "sharonline.co.il", "mynet.co.il"
+]
+
+# ← חדש שלב 5: מילות חסימה
+BLOCKED_TERMS = [
+    "sponsored", "פרסומת", "תוכן שיווקי", "תוכן ממומן",
+    "קידום מכירות", "שיתוף פעולה פרסומי", "advertorial"
+]
+
+OPINION_TERMS = [
+    "מאמר דעה", "טור דעה", "דעה:", "פרשנות:", "ניתוח:",
+    "מבט על", "כותב:", "עמדה:"
+]
+
+PR_TERMS = [
+    "הודעה לעיתונות", "יחסי ציבור", "בשיתוף", "בתמיכת",
+    "באדיבות", "בחסות"
+]
+
+# ← חדש שלב 5: חסימה מוחלטת — האתר שלנו
+BLOCKED_URLS = [
+    "tzomet-hasharon", "tzomethasharon", "צומת-השרון", "צומתהשרון"
 ]
 
 ALL_KEYWORDS = list(dict.fromkeys(
@@ -242,6 +262,15 @@ def source_from_title(title):
         return title.rsplit(" - ", 1)[-1]
     return "Google News"
 
+def is_blocked_url(url):
+    """← חדש שלב 5: חסימה מוחלטת של האתר שלנו."""
+    url_lower = url.lower()
+    return any(blocked in url_lower for blocked in BLOCKED_URLS)
+
+def is_national_source(link):
+    """בודק אם הכתבה מאתר ארצי."""
+    return any(site in link.lower() for site in NATIONAL_SITES)
+
 
 # =====================
 # TITLE DEDUPLICATION  ← שלב 3
@@ -332,13 +361,12 @@ def mark_sent(conn, article_id):
 
 
 # =====================
-# QUERIES AND FETCH  ← שלב 4: חיפושים חדשים
+# QUERIES AND FETCH
 # =====================
 
 def build_queries():
     queries = []
 
-    # חיפושי בסיס — מילות מפתח מקומיות
     for term in LOCAL_ANCHORS:
         queries.append(f"{quote(term)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
@@ -346,7 +374,6 @@ def build_queries():
         for topic in TOPICS:
             queries.append(f"{quote(area)} {quote(topic)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # חיפושי אתרים ארציים
     site_terms = list(dict.fromkeys(CORE_AREAS + LOCAL_ANCHORS + PEOPLE + COMMERCE_SPORT_HEALTH))
     for term in site_terms:
         for site in NATIONAL_SITES:
@@ -356,7 +383,6 @@ def build_queries():
         for site in LOCAL_SITES:
             queries.append(f"{quote(area)} site:{site} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # ← חדש שלב 4: גופים רשמיים
     official_bodies = [
         "עיריית רעננה", "עיריית כפר סבא", "עיריית הרצליה",
         "משטרה רעננה", "משטרה כפר סבא", "משטרה הרצליה",
@@ -367,27 +393,22 @@ def build_queries():
     for body in official_bodies:
         queries.append(f"{quote(body)} when:1d")
 
-    # ← חדש שלב 4: אירועי תרבות לפי עיר
     for city in CITIES:
         for event in CULTURE_EVENTS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # ← חדש שלב 4: אירועי ספורט לפי עיר
     for city in CITIES:
         for event in SPORT_EVENTS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # ← חדש שלב 4: אירועי קהילה לפי עיר
     for city in CITIES:
         for event in COMMUNITY_EVENTS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # ← חדש שלב 4: טבע ופנאי לפי עיר
     for city in CITIES:
         for event in NATURE_EVENTS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
-    # ← חדש שלב 4: ימים מיוחדים לפי עיר
     for city in CITIES:
         for event in SPECIAL_DAYS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
@@ -405,6 +426,10 @@ def fetch(query):
         link = clean(getattr(entry, "link", ""))
 
         if not title or not link:
+            continue
+
+        # ← חדש שלב 5: חסימה מוחלטת של האתר שלנו
+        if is_blocked_url(link):
             continue
 
         if not is_recent(entry):
@@ -425,18 +450,19 @@ def fetch(query):
 
 
 # =====================
-# RELEVANCE
+# RELEVANCE + SCORING  ← שלב 5: ניקוד מלא
 # =====================
 
 def score(raw):
     text = raw["title"] + " " + raw["link"] + " " + raw["query"]
+    title = raw["title"]
 
     keyword_hits = hits(text, ALL_KEYWORDS)
     local_hits = hits(text, LOCAL_ANCHORS)
     core_hits = hits(text, CORE_AREAS)
     topic_hits = hits(text, TOPICS)
     broad_hits = hits(text, BROAD_TERMS)
-    event_hits = hits(text, ALL_EVENT_TERMS)  # ← חדש
+    event_hits = hits(text, ALL_EVENT_TERMS)
 
     if not keyword_hits:
         return None
@@ -444,9 +470,14 @@ def score(raw):
     if broad_hits and not local_hits and not core_hits:
         return None
 
+    # ← חדש שלב 5: חסימה מוחלטת לתוכן שיווקי
+    if hits(title, BLOCKED_TERMS):
+        return None
+
     score_value = 0
     reasons = []
 
+    # ניקוד חיובי
     if core_hits:
         score_value += 5
         reasons.extend(core_hits[:3])
@@ -459,7 +490,6 @@ def score(raw):
         score_value += 2
         reasons.extend(topic_hits[:3])
 
-    # ← חדש: בונוס לאירועים
     if event_hits and core_hits:
         score_value += 3
         reasons.extend(event_hits[:2])
@@ -467,13 +497,31 @@ def score(raw):
     important = hits(text, [
         "עיריית", "מועצת העיר", "אגף ההנדסה", "ועדה מקומית", "מכרז",
         "תקציב", "פינוי בינוי", "התחדשות עירונית", "תאונת דרכים",
-        "שריפה", "פשיעה", "הפגנה", "סגירת כבישים", "ארנונה"
+        "שריפה", "פשיעה", "הפגנה", "סגירת כבישים", "ארנונה",
+        "משטרה", "מד״א", "כבאות", "זק״א"
     ])
     if important:
         score_value += 2
         reasons.extend(important[:3])
 
-    score_value = min(score_value, 10)
+    # ← חדש שלב 5: ניקוד שלילי
+    if hits(title, OPINION_TERMS):
+        score_value -= 3
+
+    if hits(title, PR_TERMS):
+        score_value -= 2
+
+    if hits(title, BLOCKED_TERMS):
+        score_value -= 5
+
+    # ← חדש שלב 5: אתר ארצי שרק מזכיר את האזור — דרישה מחמירה
+    if is_national_source(raw["link"]):
+        # אם אין hits מקומיים ספציפיים (רק שם עיר כללי) — נפסל
+        specific_local = hits(text, PLACES + BODIES_AND_INSTITUTIONS + CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH)
+        if not specific_local and len(core_hits) <= 1:
+            return None
+
+    score_value = max(0, min(score_value, 10))
 
     if score_value < MIN_SCORE:
         return None
@@ -595,6 +643,7 @@ def run_hourly():
         "skipped_old": 0,
         "skipped_irrelevant": 0,
         "skipped_duplicate": 0,
+        "skipped_blocked": 0,
         "sent": 0,
     }
 
@@ -609,6 +658,11 @@ def run_hourly():
         stats["scanned"] += len(raw_items)
 
         for raw in raw_items:
+            # ← חדש שלב 5: ספירת חסומים
+            if hits(raw["title"], BLOCKED_TERMS):
+                stats["skipped_blocked"] += 1
+                continue
+
             item = score(raw)
             if not item:
                 stats["skipped_irrelevant"] += 1
@@ -643,6 +697,7 @@ def run_hourly():
     print(f"✅ סיכום ריצה | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print(f"   נסרקו:        {stats['scanned']}")
     print(f"   נפסלו ישנים:  {stats['skipped_old']}")
+    print(f"   חסומים:       {stats['skipped_blocked']}")
     print(f"   לא רלוונטי:   {stats['skipped_irrelevant']}")
     print(f"   כפילויות:     {stats['skipped_duplicate']}")
     print(f"   נשלחו:        {stats['sent']}")
