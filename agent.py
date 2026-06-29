@@ -18,7 +18,7 @@ import re
 import sqlite3
 import hashlib
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlencode, parse_qs, urlunparse
 
 import feedparser
 import requests
@@ -140,6 +140,36 @@ BROAD_TERMS = list(dict.fromkeys(
 
 
 # =====================
+# URL NORMALIZATION  ← חדש בV5
+# =====================
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "msclkid", "mc_eid", "ref", "source",
+    "_ga", "_gl", "igshid", "s", "cmpid"
+}
+
+def normalize_url(url):
+    """מנקה URL מפרמטרי tracking ומחזיר URL נקי לצורך deduplication."""
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        clean_params = {k: v for k, v in params.items() if k.lower() not in TRACKING_PARAMS}
+        clean_query = urlencode(clean_params, doseq=True)
+        clean = urlunparse((
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/"),
+            parsed.params,
+            clean_query,
+            ""  # בלי fragment (#)
+        ))
+        return clean
+    except Exception:
+        return url
+
+
+# =====================
 # HELPERS
 # =====================
 
@@ -158,7 +188,8 @@ def hits(text, terms):
     return list(dict.fromkeys([t for t in terms if contains(text, t)]))
 
 def uid(title, link):
-    return hashlib.sha256((title + "|" + link).encode("utf-8")).hexdigest()
+    # ← חדש: משתמש ב-URL מנוקה
+    return hashlib.sha256((title + "|" + normalize_url(link)).encode("utf-8")).hexdigest()
 
 def quote(term):
     term = term.replace('"', "")
@@ -202,7 +233,7 @@ def is_recent(entry, hours=None):
         hours = MAX_AGE_HOURS
     dt = parse_date(entry)
     if dt is None:
-        return False  # אין תאריך אמין — לא מכניסים
+        return False
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     return dt >= cutoff
 
@@ -281,7 +312,7 @@ def fetch(query):
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=he&gl=IL&ceid=IL:he"
     feed = feedparser.parse(url)
     items = []
-    skipped_old = 0  # ← חדש: סופר כתבות שנפסלו בגלל גיל
+    skipped_old = 0
 
     for entry in feed.entries[:10]:
         title = clean(getattr(entry, "title", ""))
@@ -290,7 +321,6 @@ def fetch(query):
         if not title or not link:
             continue
 
-        # ← חדש: בדיקת תאריך אמיתי
         if not is_recent(entry):
             skipped_old += 1
             continue
@@ -299,13 +329,13 @@ def fetch(query):
 
         items.append({
             "title": title,
-            "link": link,
+            "link": normalize_url(link),  # ← חדש: שומרים URL מנוקה
             "published": published,
             "source": source_from_title(title),
             "query": query
         })
 
-    return items, skipped_old  # ← חדש: מחזירים גם כמה נפסלו
+    return items, skipped_old
 
 
 # =====================
@@ -467,7 +497,6 @@ def run_hourly():
     conn = db()
     candidates = {}
 
-    # ← חדש: מונים לlog
     stats = {
         "scanned": 0,
         "skipped_old": 0,
@@ -478,7 +507,7 @@ def run_hourly():
 
     for query in build_queries():
         try:
-            raw_items, skipped_old = fetch(query)  # ← חדש
+            raw_items, skipped_old = fetch(query)
             stats["skipped_old"] += skipped_old
         except Exception as e:
             print("Fetch failed:", query, e)
@@ -512,7 +541,6 @@ def run_hourly():
     for item in selected:
         mark_sent(conn, item["id"])
 
-    # ← חדש: הדפסת סיכום
     print("=" * 40)
     print(f"✅ סיכום ריצה | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print(f"   נסרקו:        {stats['scanned']}")
