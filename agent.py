@@ -33,7 +33,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "20"))
-MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "140"))
+MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "200"))
 GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
@@ -48,6 +48,8 @@ CORE_AREAS = [
     "רעננה", "כפר סבא", "הרצליה", "הרצליה פיתוח",
     "מועצה אזורית דרום השרון", "דרום השרון", "השרון"
 ]
+
+CITIES = ["רעננה", "כפר סבא", "הרצליה"]
 
 PEOPLE = [
     "חיים ברוידא", "רפי סער", "יריב פישר", "נפתלי בנט", "גדי אייזנקוט",
@@ -115,6 +117,32 @@ TOPICS = [
     "מרוץ", "הופעה", "סגירת כבישים", "מכרז", "תקציב עירוני", "סייל"
 ]
 
+# ← חדש שלב 4: נושאי אירועים
+CULTURE_EVENTS = [
+    "הופעה", "מופע", "תיאטרון", "הרצאה", "פסטיבל", "תערוכה",
+    "סיור מודרך", "קונצרט", "סטנדאפ", "קומדיה", "מחול", "אופרה",
+    "קולנוע", "ערב תרבות", "מוזיקה חיה", "להקה", "זמר"
+]
+
+SPORT_EVENTS = [
+    "משחק", "אליפות", "טורניר", "מרוץ", "טריאתלון", "ריצה",
+    "אופניים", "שחייה", "כדורגל", "כדורסל", "טניס", "התעמלות",
+    "מרתון", "דו קרב", "גמר", "ליגה", "גביע"
+]
+
+COMMUNITY_EVENTS = [
+    "כנס", "יריד", "שוק", "מפגש תושבים", "ערב פתוח", "יום פתוח",
+    "סדנה", "קורס", "השתלמות", "התנדבות", "פעילות קהילתית"
+]
+
+NATURE_EVENTS = [
+    "טיול", "סיור טבע", "פארק", "חוף", "פיקניק", "נטיעות"
+]
+
+SPECIAL_DAYS = [
+    "הדלקה", "מצעד", "טקס", "חגיגות", "אירוע מיוחד", "השקה"
+]
+
 NATIONAL_SITES = [
     "ynet.co.il", "haaretz.co.il", "themarker.com", "globes.co.il",
     "walla.co.il", "maariv.co.il", "srugim.co.il", "bhol.co.il"
@@ -126,7 +154,8 @@ LOCAL_SITES = [
 
 ALL_KEYWORDS = list(dict.fromkeys(
     CORE_AREAS + PEOPLE + PLACES + BODIES_AND_INSTITUTIONS +
-    CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH + TRANSPORT + COMPANIES + TOPICS
+    CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH + TRANSPORT + COMPANIES + TOPICS +
+    CULTURE_EVENTS + SPORT_EVENTS + COMMUNITY_EVENTS + NATURE_EVENTS + SPECIAL_DAYS
 ))
 
 LOCAL_ANCHORS = list(dict.fromkeys(
@@ -136,6 +165,10 @@ LOCAL_ANCHORS = list(dict.fromkeys(
 
 BROAD_TERMS = list(dict.fromkeys(
     TOPICS + COMPANIES + ["נפתלי בנט", "גדי אייזנקוט", "NICE", "נייס", "NVIDIA", "אנבידיה"]
+))
+
+ALL_EVENT_TERMS = list(dict.fromkeys(
+    CULTURE_EVENTS + SPORT_EVENTS + COMMUNITY_EVENTS + NATURE_EVENTS + SPECIAL_DAYS
 ))
 
 
@@ -150,7 +183,6 @@ TRACKING_PARAMS = {
 }
 
 def normalize_url(url):
-    """מנקה URL מפרמטרי tracking ומחזיר URL נקי לצורך deduplication."""
     try:
         parsed = urlparse(url)
         params = parse_qs(parsed.query, keep_blank_values=False)
@@ -216,7 +248,6 @@ def source_from_title(title):
 # =====================
 
 def title_similarity(a, b):
-    """מחזיר אחוז דמיון בין שתי כותרות (0.0 עד 1.0)."""
     a_words = set(norm(a).split())
     b_words = set(norm(b).split())
     if not a_words or not b_words:
@@ -225,7 +256,6 @@ def title_similarity(a, b):
     return len(shared) / max(len(a_words), len(b_words))
 
 def is_duplicate_title(title, seen_titles, threshold=0.9):
-    """בודק אם הכותרת דומה מדי לכותרת שכבר ראינו."""
     for seen in seen_titles:
         if title_similarity(title, seen) >= threshold:
             return True
@@ -237,7 +267,6 @@ def is_duplicate_title(title, seen_titles, threshold=0.9):
 # =====================
 
 def parse_date(entry):
-    """מנסה לחלץ תאריך אמין מה־entry. מחזיר datetime עם timezone או None."""
     for field in ("published_parsed", "updated_parsed"):
         val = getattr(entry, field, None)
         if val:
@@ -248,7 +277,6 @@ def parse_date(entry):
     return None
 
 def is_recent(entry, hours=None):
-    """מחזיר True אם הכתבה פורסמה בטווח השעות המוגדר. אם אין תאריך — לא מכניסים."""
     if hours is None:
         hours = MAX_AGE_HOURS
     dt = parse_date(entry)
@@ -304,12 +332,13 @@ def mark_sent(conn, article_id):
 
 
 # =====================
-# QUERIES AND FETCH
+# QUERIES AND FETCH  ← שלב 4: חיפושים חדשים
 # =====================
 
 def build_queries():
     queries = []
 
+    # חיפושי בסיס — מילות מפתח מקומיות
     for term in LOCAL_ANCHORS:
         queries.append(f"{quote(term)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
@@ -317,6 +346,7 @@ def build_queries():
         for topic in TOPICS:
             queries.append(f"{quote(area)} {quote(topic)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
+    # חיפושי אתרים ארציים
     site_terms = list(dict.fromkeys(CORE_AREAS + LOCAL_ANCHORS + PEOPLE + COMMERCE_SPORT_HEALTH))
     for term in site_terms:
         for site in NATIONAL_SITES:
@@ -325,6 +355,42 @@ def build_queries():
     for area in CORE_AREAS:
         for site in LOCAL_SITES:
             queries.append(f"{quote(area)} site:{site} when:{GOOGLE_NEWS_DAYS_BACK}d")
+
+    # ← חדש שלב 4: גופים רשמיים
+    official_bodies = [
+        "עיריית רעננה", "עיריית כפר סבא", "עיריית הרצליה",
+        "משטרה רעננה", "משטרה כפר סבא", "משטרה הרצליה",
+        "מד״א רעננה", "מד״א כפר סבא", "מד״א הרצליה",
+        "כבאות רעננה", "כבאות כפר סבא", "כבאות הרצליה",
+        "זק״א שרון", "הצלה רעננה", "הצלה כפר סבא",
+    ]
+    for body in official_bodies:
+        queries.append(f"{quote(body)} when:1d")
+
+    # ← חדש שלב 4: אירועי תרבות לפי עיר
+    for city in CITIES:
+        for event in CULTURE_EVENTS:
+            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
+
+    # ← חדש שלב 4: אירועי ספורט לפי עיר
+    for city in CITIES:
+        for event in SPORT_EVENTS:
+            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
+
+    # ← חדש שלב 4: אירועי קהילה לפי עיר
+    for city in CITIES:
+        for event in COMMUNITY_EVENTS:
+            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
+
+    # ← חדש שלב 4: טבע ופנאי לפי עיר
+    for city in CITIES:
+        for event in NATURE_EVENTS:
+            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
+
+    # ← חדש שלב 4: ימים מיוחדים לפי עיר
+    for city in CITIES:
+        for event in SPECIAL_DAYS:
+            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
     return list(dict.fromkeys(queries))[:MAX_QUERIES_PER_RUN]
 
@@ -370,6 +436,7 @@ def score(raw):
     core_hits = hits(text, CORE_AREAS)
     topic_hits = hits(text, TOPICS)
     broad_hits = hits(text, BROAD_TERMS)
+    event_hits = hits(text, ALL_EVENT_TERMS)  # ← חדש
 
     if not keyword_hits:
         return None
@@ -391,6 +458,11 @@ def score(raw):
     if topic_hits:
         score_value += 2
         reasons.extend(topic_hits[:3])
+
+    # ← חדש: בונוס לאירועים
+    if event_hits and core_hits:
+        score_value += 3
+        reasons.extend(event_hits[:2])
 
     important = hits(text, [
         "עיריית", "מועצת העיר", "אגף ההנדסה", "ועדה מקומית", "מכרז",
@@ -516,7 +588,7 @@ def daily_message(conn):
 def run_hourly():
     conn = db()
     candidates = {}
-    seen_titles = []  # ← שלב 3: לזכור כותרות שכבר ראינו
+    seen_titles = []
 
     stats = {
         "scanned": 0,
@@ -548,7 +620,6 @@ def run_hourly():
                 stats["skipped_duplicate"] += 1
                 continue
 
-            # ← שלב 3: בדיקת דמיון כותרות
             if is_duplicate_title(item["title"], seen_titles):
                 stats["skipped_duplicate"] += 1
                 continue
