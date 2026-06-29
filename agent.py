@@ -37,6 +37,7 @@ MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "140"))
 GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
+MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
 
 
 # =====================
@@ -181,6 +182,32 @@ def source_from_title(title):
 
 
 # =====================
+# DATE FILTERING  ← חדש בV5
+# =====================
+
+def parse_date(entry):
+    """מנסה לחלץ תאריך אמין מה־entry. מחזיר datetime עם timezone או None."""
+    for field in ("published_parsed", "updated_parsed"):
+        val = getattr(entry, field, None)
+        if val:
+            try:
+                return datetime(*val[:6], tzinfo=timezone.utc)
+            except Exception:
+                continue
+    return None
+
+def is_recent(entry, hours=None):
+    """מחזיר True אם הכתבה פורסמה בטווח השעות המוגדר. אם אין תאריך — לא מכניסים."""
+    if hours is None:
+        hours = MAX_AGE_HOURS
+    dt = parse_date(entry)
+    if dt is None:
+        return False  # אין תאריך אמין — לא מכניסים
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return dt >= cutoff
+
+
+# =====================
 # DATABASE
 # =====================
 
@@ -254,14 +281,21 @@ def fetch(query):
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=he&gl=IL&ceid=IL:he"
     feed = feedparser.parse(url)
     items = []
+    skipped_old = 0  # ← חדש: סופר כתבות שנפסלו בגלל גיל
 
     for entry in feed.entries[:10]:
         title = clean(getattr(entry, "title", ""))
         link = clean(getattr(entry, "link", ""))
-        published = clean(getattr(entry, "published", ""))
 
         if not title or not link:
             continue
+
+        # ← חדש: בדיקת תאריך אמיתי
+        if not is_recent(entry):
+            skipped_old += 1
+            continue
+
+        published = clean(getattr(entry, "published", ""))
 
         items.append({
             "title": title,
@@ -271,7 +305,7 @@ def fetch(query):
             "query": query
         })
 
-    return items
+    return items, skipped_old  # ← חדש: מחזירים גם כמה נפסלו
 
 
 # =====================
@@ -433,21 +467,35 @@ def run_hourly():
     conn = db()
     candidates = {}
 
+    # ← חדש: מונים לlog
+    stats = {
+        "scanned": 0,
+        "skipped_old": 0,
+        "skipped_irrelevant": 0,
+        "skipped_duplicate": 0,
+        "sent": 0,
+    }
+
     for query in build_queries():
         try:
-            raw_items = fetch(query)
+            raw_items, skipped_old = fetch(query)  # ← חדש
+            stats["skipped_old"] += skipped_old
         except Exception as e:
             print("Fetch failed:", query, e)
             continue
 
+        stats["scanned"] += len(raw_items)
+
         for raw in raw_items:
             item = score(raw)
             if not item:
+                stats["skipped_irrelevant"] += 1
                 continue
 
             record_found(conn, item)
 
             if already_sent(conn, item["id"]):
+                stats["skipped_duplicate"] += 1
                 continue
 
             if item["id"] not in candidates or item["score"] > candidates[item["id"]]["score"]:
@@ -456,6 +504,7 @@ def run_hourly():
         time.sleep(0.12)
 
     selected = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:MAX_ITEMS_PER_RUN]
+    stats["sent"] = len(selected)
 
     if selected or SEND_EMPTY_REPORT:
         send_telegram(hourly_message(selected))
@@ -463,7 +512,15 @@ def run_hourly():
     for item in selected:
         mark_sent(conn, item["id"])
 
-    print("Sent:", len(selected))
+    # ← חדש: הדפסת סיכום
+    print("=" * 40)
+    print(f"✅ סיכום ריצה | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    print(f"   נסרקו:        {stats['scanned']}")
+    print(f"   נפסלו ישנים:  {stats['skipped_old']}")
+    print(f"   לא רלוונטי:   {stats['skipped_irrelevant']}")
+    print(f"   כפילויות:     {stats['skipped_duplicate']}")
+    print(f"   נשלחו:        {stats['sent']}")
+    print("=" * 40)
 
 def run_daily():
     conn = db()
