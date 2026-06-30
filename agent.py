@@ -484,7 +484,8 @@ def score(raw):
     if broad_hits and not local_hits and not core_hits:
         return None
 
-    if specific_count < MIN_LOCAL_HITS:
+    # דרישה ריאלית: לפחות מילת מפתח ספציפית אחת (רחוב/מוסד/גוף) + שם עיר/אזור
+    if specific_count < 1 or not core_hits:
         return None
 
     score_value = 0
