@@ -38,7 +38,7 @@ GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
-MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "3"))
+MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "6"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -484,7 +484,7 @@ def score(raw):
     if broad_hits and not local_hits and not core_hits:
         return None
 
-    if specific_count < MIN_LOCAL_HITS and not hits(title, CORE_AREAS + PEOPLE):
+    if specific_count < MIN_LOCAL_HITS:
         return None
 
     score_value = 0
@@ -570,7 +570,7 @@ def send_telegram(text):
         time.sleep(0.4)
 
 def send_article_with_buttons(item):
-    """← חדש: שולח כתבה בודדת עם כפתורי שכתב/דלג."""
+    """← שולח כתבה בודדת עם כפתורי שכתב/דלג."""
     text_lines = [
         f"📍 {item['city']}",
         "",
@@ -580,10 +580,13 @@ def send_article_with_buttons(item):
     ]
     text = "\n".join(text_lines)
 
+    # ← תיקון: callback_data מוגבל ל-64 בייטים בטלגרם. מקצרים את ה-id.
+    short_id = item["id"][:16]
+
     reply_markup = {
         "inline_keyboard": [[
-            {"text": "✏️ שכתב", "callback_data": f"rewrite:{item['id']}"},
-            {"text": "🗑️ דלג", "callback_data": f"delete:{item['id']}"}
+            {"text": "✏️ שכתב", "callback_data": f"rw:{short_id}"},
+            {"text": "🗑️ דלג", "callback_data": f"dl:{short_id}"}
         ]]
     }
 
