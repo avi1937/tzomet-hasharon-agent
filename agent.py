@@ -31,13 +31,16 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-MIN_SCORE = int(os.getenv("MIN_SCORE", "6"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "4"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "20"))
 MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "200"))
 GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
+MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "3"))
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
 # =====================
@@ -151,7 +154,16 @@ LOCAL_SITES = [
     "tzomet-hrz.co.il", "hasharon-post.co.il", "sharonline.co.il", "mynet.co.il"
 ]
 
-# ← חדש שלב 5: מילות חסימה
+BLOCKED_URL_PATTERNS = [
+    "tzomet-hasharon", "tzomethasharon", "tzomet-hrz",
+    "צומת-השרון", "צומתהשרון"
+]
+
+BLOCKED_TITLE_PATTERNS = [
+    "צומת השרון הרצליה", "צומת השרון כפר סבא", "צומת השרון רעננה",
+    "tzomet hasharon", "tzomet-hasharon"
+]
+
 BLOCKED_TERMS = [
     "sponsored", "פרסומת", "תוכן שיווקי", "תוכן ממומן",
     "קידום מכירות", "שיתוף פעולה פרסומי", "advertorial"
@@ -167,11 +179,6 @@ PR_TERMS = [
     "באדיבות", "בחסות"
 ]
 
-# ← חדש שלב 5: חסימה מוחלטת — האתר שלנו
-BLOCKED_URLS = [
-    "tzomet-hasharon", "tzomethasharon", "צומת-השרון", "צומתהשרון"
-]
-
 ALL_KEYWORDS = list(dict.fromkeys(
     CORE_AREAS + PEOPLE + PLACES + BODIES_AND_INSTITUTIONS +
     CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH + TRANSPORT + COMPANIES + TOPICS +
@@ -181,6 +188,11 @@ ALL_KEYWORDS = list(dict.fromkeys(
 LOCAL_ANCHORS = list(dict.fromkeys(
     CORE_AREAS + PEOPLE + PLACES + BODIES_AND_INSTITUTIONS +
     CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH + TRANSPORT
+))
+
+SPECIFIC_LOCAL = list(dict.fromkeys(
+    PLACES + BODIES_AND_INSTITUTIONS + CULTURE_ATTRACTIONS +
+    COMMERCE_SPORT_HEALTH + TRANSPORT + PEOPLE
 ))
 
 BROAD_TERMS = list(dict.fromkeys(
@@ -193,7 +205,7 @@ ALL_EVENT_TERMS = list(dict.fromkeys(
 
 
 # =====================
-# URL NORMALIZATION  ← שלב 2
+# URL NORMALIZATION
 # =====================
 
 TRACKING_PARAMS = {
@@ -263,17 +275,22 @@ def source_from_title(title):
     return "Google News"
 
 def is_blocked_url(url):
-    """← חדש שלב 5: חסימה מוחלטת של האתר שלנו."""
     url_lower = url.lower()
-    return any(blocked in url_lower for blocked in BLOCKED_URLS)
+    return any(p in url_lower for p in BLOCKED_URL_PATTERNS)
+
+def is_blocked_title(title):
+    title_lower = norm(title)
+    return any(norm(p) in title_lower for p in BLOCKED_TITLE_PATTERNS)
 
 def is_national_source(link):
-    """בודק אם הכתבה מאתר ארצי."""
     return any(site in link.lower() for site in NATIONAL_SITES)
+
+def count_specific_local_hits(text):
+    return len(hits(text, SPECIFIC_LOCAL))
 
 
 # =====================
-# TITLE DEDUPLICATION  ← שלב 3
+# TITLE DEDUPLICATION
 # =====================
 
 def title_similarity(a, b):
@@ -292,7 +309,7 @@ def is_duplicate_title(title, seen_titles, threshold=0.9):
 
 
 # =====================
-# DATE FILTERING  ← שלב 1
+# DATE FILTERING
 # =====================
 
 def parse_date(entry):
@@ -328,14 +345,21 @@ def db():
             title TEXT,
             link TEXT,
             source TEXT,
-            score INTEGER,
             city TEXT,
             reasons TEXT,
             query TEXT,
             first_seen_at TEXT,
-            sent_at TEXT
+            sent_at TEXT,
+            status TEXT,
+            status_at TEXT,
+            telegram_message_id TEXT
         )
     """)
+    # הוספת עמודות אם חסרות (תאימות לאחור)
+    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()]
+    for col in ["status", "status_at", "telegram_message_id"]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {col} TEXT")
     conn.commit()
     return conn
 
@@ -346,17 +370,20 @@ def already_sent(conn, article_id):
 def record_found(conn, item):
     conn.execute("""
         INSERT OR IGNORE INTO articles
-        (id,title,link,source,score,city,reasons,query,first_seen_at)
+        (id,title,link,source,city,reasons,query,first_seen_at,status)
         VALUES (?,?,?,?,?,?,?,?,?)
     """, (
-        item["id"], item["title"], item["link"], item["source"], item["score"],
+        item["id"], item["title"], item["link"], item["source"],
         item["city"], json.dumps(item["reasons"], ensure_ascii=False),
-        item["query"], datetime.now(timezone.utc).isoformat()
+        item["query"], datetime.now(timezone.utc).isoformat(), "pending"
     ))
     conn.commit()
 
-def mark_sent(conn, article_id):
-    conn.execute("UPDATE articles SET sent_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), article_id))
+def mark_sent(conn, article_id, message_id=None):
+    conn.execute(
+        "UPDATE articles SET sent_at=?, telegram_message_id=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), str(message_id) if message_id else None, article_id)
+    )
     conn.commit()
 
 
@@ -394,23 +421,7 @@ def build_queries():
         queries.append(f"{quote(body)} when:1d")
 
     for city in CITIES:
-        for event in CULTURE_EVENTS:
-            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
-
-    for city in CITIES:
-        for event in SPORT_EVENTS:
-            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
-
-    for city in CITIES:
-        for event in COMMUNITY_EVENTS:
-            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
-
-    for city in CITIES:
-        for event in NATURE_EVENTS:
-            queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
-
-    for city in CITIES:
-        for event in SPECIAL_DAYS:
+        for event in CULTURE_EVENTS + SPORT_EVENTS + COMMUNITY_EVENTS + NATURE_EVENTS + SPECIAL_DAYS:
             queries.append(f"{quote(city)} {quote(event)} when:{GOOGLE_NEWS_DAYS_BACK}d")
 
     return list(dict.fromkeys(queries))[:MAX_QUERIES_PER_RUN]
@@ -428,8 +439,7 @@ def fetch(query):
         if not title or not link:
             continue
 
-        # ← חדש שלב 5: חסימה מוחלטת של האתר שלנו
-        if is_blocked_url(link):
+        if is_blocked_url(link) or is_blocked_title(title):
             continue
 
         if not is_recent(entry):
@@ -450,12 +460,15 @@ def fetch(query):
 
 
 # =====================
-# RELEVANCE + SCORING  ← שלב 5: ניקוד מלא
+# RELEVANCE + SCORING
 # =====================
 
 def score(raw):
     text = raw["title"] + " " + raw["link"] + " " + raw["query"]
     title = raw["title"]
+
+    if hits(title, BLOCKED_TERMS):
+        return None
 
     keyword_hits = hits(text, ALL_KEYWORDS)
     local_hits = hits(text, LOCAL_ANCHORS)
@@ -463,6 +476,7 @@ def score(raw):
     topic_hits = hits(text, TOPICS)
     broad_hits = hits(text, BROAD_TERMS)
     event_hits = hits(text, ALL_EVENT_TERMS)
+    specific_count = count_specific_local_hits(text)
 
     if not keyword_hits:
         return None
@@ -470,14 +484,12 @@ def score(raw):
     if broad_hits and not local_hits and not core_hits:
         return None
 
-    # ← חדש שלב 5: חסימה מוחלטת לתוכן שיווקי
-    if hits(title, BLOCKED_TERMS):
+    if specific_count < MIN_LOCAL_HITS and not hits(title, CORE_AREAS + PEOPLE):
         return None
 
     score_value = 0
     reasons = []
 
-    # ניקוד חיובי
     if core_hits:
         score_value += 5
         reasons.extend(core_hits[:3])
@@ -504,19 +516,13 @@ def score(raw):
         score_value += 2
         reasons.extend(important[:3])
 
-    # ← חדש שלב 5: ניקוד שלילי
     if hits(title, OPINION_TERMS):
         score_value -= 3
 
     if hits(title, PR_TERMS):
         score_value -= 2
 
-    if hits(title, BLOCKED_TERMS):
-        score_value -= 5
-
-    # ← חדש שלב 5: אתר ארצי שרק מזכיר את האזור — דרישה מחמירה
     if is_national_source(raw["link"]):
-        # אם אין hits מקומיים ספציפיים (רק שם עיר כללי) — נפסל
         specific_local = hits(text, PLACES + BODIES_AND_INSTITUTIONS + CULTURE_ATTRACTIONS + COMMERCE_SPORT_HEALTH)
         if not specific_local and len(core_hits) <= 1:
             return None
@@ -534,7 +540,7 @@ def score(raw):
         "query": raw["query"],
         "score": score_value,
         "city": detect_city(text),
-        "reasons": list(dict.fromkeys(reasons))[:7],
+        "reasons": list(dict.fromkeys(reasons))[:5],
     }
 
 
@@ -552,7 +558,7 @@ def send_telegram(text):
 
     for chunk in chunks:
         r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": chunk,
@@ -563,64 +569,71 @@ def send_telegram(text):
         r.raise_for_status()
         time.sleep(0.4)
 
+def send_article_with_buttons(item):
+    """← חדש: שולח כתבה בודדת עם כפתורי שכתב/דלג."""
+    text_lines = [
+        f"📍 {item['city']}",
+        "",
+        item["title"],
+        f"מקור: {item['source']}",
+        item["link"]
+    ]
+    text = "\n".join(text_lines)
+
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": "✏️ שכתב", "callback_data": f"rewrite:{item['id']}"},
+            {"text": "🗑️ דלג", "callback_data": f"delete:{item['id']}"}
+        ]]
+    }
+
+    try:
+        r = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": reply_markup
+            },
+            timeout=25
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data.get("result", {}).get("message_id")
+    except Exception as e:
+        print("Send article failed:", e)
+        return None
+
 
 # =====================
 # MESSAGES
 # =====================
-
-def hourly_message(items):
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    if not items:
-        return f"🔎 צומת השרון | {now}\n\nלא נמצאו אייטמים חדשים שעברו סינון."
-
-    lines = [
-        "🔔 צומת השרון | סוכן חדשות מקומיות",
-        now,
-        "",
-        f"נמצאו {len(items)} אייטמים חדשים:",
-        ""
-    ]
-
-    for i, item in enumerate(items, 1):
-        reasons = ", ".join(item["reasons"]) if item["reasons"] else "התאמה לרשימת החיפוש"
-        lines.extend([
-            f"{i}. ⭐ {item['score']}/10 | {item['city']}",
-            item["title"],
-            f"מקור: {item['source']}",
-            f"למה נשלח: {reasons}",
-            item["link"],
-            ""
-        ])
-
-    return "\n".join(lines)
 
 def daily_message(conn):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     rows = conn.execute("""
         SELECT * FROM articles
         WHERE first_seen_at >= ?
-        ORDER BY score DESC, first_seen_at DESC
+        ORDER BY first_seen_at DESC
         LIMIT 50
     """, (cutoff,)).fetchall()
 
     total = len(rows)
-    high = len([r for r in rows if int(r["score"] or 0) >= 8])
 
     lines = [
         "📊 צומת השרון | סיכום יומי",
         datetime.now().strftime("%d/%m/%Y"),
         "",
-        f"סה״כ אייטמים ב-24 שעות: {total}",
-        f"אייטמים בציון 8 ומעלה: {high}",
+        f"סה״כ ידיעות ב-24 שעות: {total}",
         "",
-        "האייטמים הבולטים:"
+        "הידיעות האחרונות:"
     ]
 
     for i, r in enumerate(rows[:20], 1):
         lines.extend([
             "",
-            f"{i}. ⭐ {r['score']}/10 | {r['city']}",
+            f"{i}. 📍 {r['city']}",
             r["title"],
             f"מקור: {r['source']}",
             r["link"]
@@ -658,7 +671,6 @@ def run_hourly():
         stats["scanned"] += len(raw_items)
 
         for raw in raw_items:
-            # ← חדש שלב 5: ספירת חסומים
             if hits(raw["title"], BLOCKED_TERMS):
                 stats["skipped_blocked"] += 1
                 continue
@@ -687,11 +699,14 @@ def run_hourly():
     selected = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:MAX_ITEMS_PER_RUN]
     stats["sent"] = len(selected)
 
-    if selected or SEND_EMPTY_REPORT:
-        send_telegram(hourly_message(selected))
-
+    # ← חדש: שולח כל כתבה בנפרד עם כפתורים, במקום הודעה מרוכזת
     for item in selected:
-        mark_sent(conn, item["id"])
+        message_id = send_article_with_buttons(item)
+        mark_sent(conn, item["id"], message_id)
+        time.sleep(0.4)
+
+    if not selected and SEND_EMPTY_REPORT:
+        send_telegram(f"🔎 צומת השרון | {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\nלא נמצאו ידיעות חדשות שעברו סינון.")
 
     print("=" * 40)
     print(f"✅ סיכום ריצה | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
