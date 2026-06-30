@@ -38,7 +38,7 @@ GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
-MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "6"))
+MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "4"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
