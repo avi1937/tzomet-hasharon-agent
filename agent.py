@@ -80,7 +80,8 @@ BODIES_AND_INSTITUTIONS = [
     "אגף ההנדסה רעננה", "אגף ההנדסה כפר סבא", "אגף ההנדסה הרצליה",
     "תיכון מטרווסט", "תיכון אביב", "אוסטרובסקי", "היובל רעננה",
     "כצנלסון", "הרצוג", "בר לב", "אוניברסיטת רייכמן",
-    "המרכז הבינתחומי", "מכללת בית ברל", "הראשונים הרצליה", "הנדסאים הרצליה"
+    "המרכז הבינתחומי", "מכללת בית ברל", "הראשונים הרצליה", "הנדסאים הרצליה",
+    "רייכמן", "אוניברסיטת רייכמן הרצליה", "כנס הרצליה", "בועז גנור"
 ]
 
 CULTURE_ATTRACTIONS = [
@@ -152,11 +153,16 @@ NATIONAL_SITES = [
 ]
 
 LOCAL_SITES = [
-    "tzomet-hrz.co.il", "hasharon-post.co.il", "sharonline.co.il", "mynet.co.il"
+    "hasharon-post.co.il", "sharonline.co.il", "inhasharon.co.il", "hoha.co.il",
+    "kfarsaba.news", "raanana.news", "herzlia.news", "kfarsabanews.com",
+    "raanana.muni.il", "kfar-saba.muni.il", "herzliya.muni.il",
+    "hamal.co.il",
+    "runi.ac.il"
 ]
 
 BLOCKED_URL_PATTERNS = [
-    "tzomet-hasharon", "tzomethasharon", "tzomet-hrz",
+    "tzomet-hasharon", "tzomethasharon",
+    "tzomet-hrz", "tzomet-ran", "tzomet-kfs", "tzomet-ha",
     "צומת-השרון", "צומתהשרון"
 ]
 
@@ -383,29 +389,92 @@ def db():
         _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _sb_client
 
-def load_recent_sent(client, days=4):
+def _reset_client():
+    """סוגר ומאפס את החיבור ל-Supabase, כדי שהקריאה הבאה תפתח חיבור טרי."""
+    global _sb_client
+    _sb_client = None
+    return db()
+
+def _retry(action, what, attempts=4):
+    """
+    מריץ פעולה מול Supabase עם ניסיונות חוזרים.
+    אם החיבור נופל (StreamReset / ConnectionTerminated) — פותח חיבור חדש ומנסה שוב.
+    action מקבל client ומחזיר תוצאה.
+    """
+    client = db()
+    delay = 0.5
+    for i in range(attempts):
+        try:
+            return action(client)
+        except Exception as e:
+            msg = str(e)
+            is_conn = ("StreamReset" in msg or "ConnectionTerminated" in msg
+                       or "Server disconnected" in msg or "RemoteProtocolError" in msg
+                       or "ConnectionError" in msg or "timed out" in msg.lower())
+            if i == attempts - 1:
+                print(f"{what} failed (after {attempts} tries):", msg)
+                return None
+            if is_conn:
+                # החיבור נפל — נפתח חדש ונשהה מעט
+                time.sleep(delay)
+                client = _reset_client()
+                delay = min(delay * 2, 4)
+            else:
+                # שגיאה אחרת (נתונים וכו') — אין טעם לנסות שוב
+                print(f"{what} failed:", msg)
+                return None
+    return None
+
+def load_recent_sent(client=None, days=4):
     """טוען מ-Supabase את כל מה שכבר נשלח בימים האחרונים, כדי למנוע כפילויות."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     sent_ids, sent_tkeys = set(), set()
-    try:
-        res = (client.table("articles")
-               .select("id,title_key,sent_at")
-               .gte("first_seen_at", cutoff)
-               .execute())
-        for row in (res.data or []):
-            if row.get("sent_at"):
-                if row.get("id"):
-                    sent_ids.add(row["id"])
-                if row.get("title_key"):
-                    sent_tkeys.add(row["title_key"])
-    except Exception as e:
-        print("load_recent_sent failed:", e)
+
+    def _do(c):
+        return (c.table("articles")
+                .select("id,title_key,sent_at")
+                .gte("first_seen_at", cutoff)
+                .execute())
+
+    res = _retry(_do, "load_recent_sent")
+    for row in ((res.data if res else None) or []):
+        if row.get("sent_at"):
+            if row.get("id"):
+                sent_ids.add(row["id"])
+            if row.get("title_key"):
+                sent_tkeys.add(row["title_key"])
     return sent_ids, sent_tkeys
 
 def record_found(client, item):
     """שומר ידיעה שנמצאה. אם היא כבר קיימת — לא דורס (ignore_duplicates)."""
-    try:
-        client.table("articles").upsert({
+    payload = {
+        "id": item["id"],
+        "title": item["title"],
+        "link": item["link"],
+        "source": item["source"],
+        "city": item["city"],
+        "reasons": json.dumps(item["reasons"], ensure_ascii=False),
+        "query": item["query"],
+        "title_key": item["title_key"],
+        "first_seen_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+
+    def _do(c):
+        return (c.table("articles")
+                .upsert(payload, on_conflict="id", ignore_duplicates=True)
+                .execute())
+
+    _retry(_do, "record_found")
+
+def record_found_bulk(client, items):
+    """שומר קבוצת ידיעות בבת אחת (בקשה אחת במקום עשרות) — הרבה יותר יציב."""
+    if not items:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in items:
+        rows.append({
             "id": item["id"],
             "title": item["title"],
             "link": item["link"],
@@ -414,21 +483,32 @@ def record_found(client, item):
             "reasons": json.dumps(item["reasons"], ensure_ascii=False),
             "query": item["query"],
             "title_key": item["title_key"],
-            "first_seen_at": datetime.now(timezone.utc).isoformat(),
+            "first_seen_at": now,
             "status": "pending",
-        }, on_conflict="id", ignore_duplicates=True).execute()
-    except Exception as e:
-        print("record_found failed:", e)
+        })
+
+    def _do(c):
+        return (c.table("articles")
+                .upsert(rows, on_conflict="id", ignore_duplicates=True)
+                .execute())
+
+    _retry(_do, "record_found_bulk")
 
 def mark_sent(client, article_id, message_id=None):
     """מסמן ידיעה כ'נשלחה' כדי שלא תישלח שוב אף פעם."""
-    try:
-        client.table("articles").update({
-            "sent_at": datetime.now(timezone.utc).isoformat(),
-            "telegram_message_id": str(message_id) if message_id else None,
-        }).eq("id", article_id).execute()
-    except Exception as e:
-        print("mark_sent failed:", e)
+    payload = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "telegram_message_id": str(message_id) if message_id else None,
+        "status": "sent",
+    }
+
+    def _do(c):
+        return (c.table("articles")
+                .update(payload)
+                .eq("id", article_id)
+                .execute())
+
+    _retry(_do, "mark_sent")
 
 
 # =====================
@@ -752,8 +832,6 @@ def run_hourly():
                 stats["skipped_irrelevant"] += 1
                 continue
 
-            record_found(client, item)
-
             # כבר נשלח בעבר (נשמר ב-Supabase) — לפי מזהה או לפי כותרת
             if item["id"] in sent_ids or item["title_key"] in sent_tkeys:
                 stats["skipped_duplicate"] += 1
@@ -773,6 +851,9 @@ def run_hourly():
 
     selected = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:MAX_ITEMS_PER_RUN]
     stats["sent"] = len(selected)
+
+    # שמירת כל הנבחרים ב-Supabase בבת אחת (בקשה אחת יציבה במקום עשרות)
+    record_found_bulk(client, selected)
 
     # ← שולח כל כתבה בנפרד עם כפתורים, ומסמן מיד כ'נשלחה'
     for item in selected:
