@@ -15,13 +15,13 @@ import time
 import json
 import html
 import re
-import sqlite3
 import hashlib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus, urlparse, urlencode, parse_qs, urlunparse
 
 import feedparser
 import requests
+from supabase import create_client, Client
 
 
 # =====================
@@ -36,7 +36,8 @@ MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "20"))
 MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "200"))
 GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
-SQLITE_PATH = os.getenv("SQLITE_PATH", "agent_state.sqlite3")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
 MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "4"))
 
@@ -159,6 +160,20 @@ BLOCKED_URL_PATTERNS = [
     "צומת-השרון", "צומתהשרון"
 ]
 
+# אתרי ספורט שלא רוצים בכלל (ערוץ 5 / ספורט 5, ONE, ספורט 1)
+BLOCKED_SPORT_DOMAINS = [
+    "sport5.co.il",
+    "one.co.il",
+    "sport1.co.il",
+]
+
+# שמות המקורות כפי שהם מופיעים ב-Google News (גיבוי לחסימה לפי דומיין)
+BLOCKED_SPORT_SOURCE_NAMES = [
+    "sport5", "sport 5", "ספורט 5", "ערוץ הספורט", "ערוץ 5",
+    "one", "וואן",
+    "sport1", "sport 1", "ספורט 1",
+]
+
 BLOCKED_TITLE_PATTERNS = [
     "צומת השרון הרצליה", "צומת השרון כפר סבא", "צומת השרון רעננה",
     "tzomet hasharon", "tzomet-hasharon"
@@ -254,6 +269,10 @@ def hits(text, terms):
 def uid(title, link):
     return hashlib.sha256((title + "|" + normalize_url(link)).encode("utf-8")).hexdigest()
 
+def title_key(title):
+    # מפתח יציב לפי הכותרת בלבד — תופס כפילויות של אותה ידיעה גם כשהקישור משתנה
+    return hashlib.sha256(norm(title).encode("utf-8")).hexdigest()
+
 def quote(term):
     term = term.replace('"', "")
     return '"' + term + '"' if " " in term else term
@@ -277,6 +296,23 @@ def source_from_title(title):
 def is_blocked_url(url):
     url_lower = url.lower()
     return any(p in url_lower for p in BLOCKED_URL_PATTERNS)
+
+def is_sport_source(source_name, source_url):
+    """← חוסם ידיעות שמגיעות מאתרי ספורט (לפי דומיין המקור או שם המקור)."""
+    if source_url:
+        try:
+            host = urlparse(source_url).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if any(host == d or host.endswith("." + d) for d in BLOCKED_SPORT_DOMAINS):
+                return True
+        except Exception:
+            pass
+    s = " " + norm(source_name) + " "
+    for name in BLOCKED_SPORT_SOURCE_NAMES:
+        if (" " + norm(name) + " ") in s:
+            return True
+    return False
 
 def is_blocked_title(title):
     title_lower = norm(title)
@@ -333,58 +369,66 @@ def is_recent(entry, hours=None):
 
 
 # =====================
-# DATABASE
+# DATABASE (Supabase)
 # =====================
 
+_sb_client = None
+
 def db():
-    conn = sqlite3.connect(SQLITE_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            link TEXT,
-            source TEXT,
-            city TEXT,
-            reasons TEXT,
-            query TEXT,
-            first_seen_at TEXT,
-            sent_at TEXT,
-            status TEXT,
-            status_at TEXT,
-            telegram_message_id TEXT
-        )
-    """)
-    # הוספת עמודות אם חסרות (תאימות לאחור)
-    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()]
-    for col in ["status", "status_at", "telegram_message_id"]:
-        if col not in existing_cols:
-            conn.execute(f"ALTER TABLE articles ADD COLUMN {col} TEXT")
-    conn.commit()
-    return conn
+    """מחזיר חיבור ל-Supabase (נשמר בין קריאות)."""
+    global _sb_client
+    if _sb_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb_client
 
-def already_sent(conn, article_id):
-    row = conn.execute("SELECT 1 FROM articles WHERE id=? AND sent_at IS NOT NULL", (article_id,)).fetchone()
-    return row is not None
+def load_recent_sent(client, days=4):
+    """טוען מ-Supabase את כל מה שכבר נשלח בימים האחרונים, כדי למנוע כפילויות."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    sent_ids, sent_tkeys = set(), set()
+    try:
+        res = (client.table("articles")
+               .select("id,title_key,sent_at")
+               .gte("first_seen_at", cutoff)
+               .execute())
+        for row in (res.data or []):
+            if row.get("sent_at"):
+                if row.get("id"):
+                    sent_ids.add(row["id"])
+                if row.get("title_key"):
+                    sent_tkeys.add(row["title_key"])
+    except Exception as e:
+        print("load_recent_sent failed:", e)
+    return sent_ids, sent_tkeys
 
-def record_found(conn, item):
-    conn.execute("""
-        INSERT OR IGNORE INTO articles
-        (id,title,link,source,city,reasons,query,first_seen_at,status)
-        VALUES (?,?,?,?,?,?,?,?,?)
-    """, (
-        item["id"], item["title"], item["link"], item["source"],
-        item["city"], json.dumps(item["reasons"], ensure_ascii=False),
-        item["query"], datetime.now(timezone.utc).isoformat(), "pending"
-    ))
-    conn.commit()
+def record_found(client, item):
+    """שומר ידיעה שנמצאה. אם היא כבר קיימת — לא דורס (ignore_duplicates)."""
+    try:
+        client.table("articles").upsert({
+            "id": item["id"],
+            "title": item["title"],
+            "link": item["link"],
+            "source": item["source"],
+            "city": item["city"],
+            "reasons": json.dumps(item["reasons"], ensure_ascii=False),
+            "query": item["query"],
+            "title_key": item["title_key"],
+            "first_seen_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+        }, on_conflict="id", ignore_duplicates=True).execute()
+    except Exception as e:
+        print("record_found failed:", e)
 
-def mark_sent(conn, article_id, message_id=None):
-    conn.execute(
-        "UPDATE articles SET sent_at=?, telegram_message_id=? WHERE id=?",
-        (datetime.now(timezone.utc).isoformat(), str(message_id) if message_id else None, article_id)
-    )
-    conn.commit()
+def mark_sent(client, article_id, message_id=None):
+    """מסמן ידיעה כ'נשלחה' כדי שלא תישלח שוב אף פעם."""
+    try:
+        client.table("articles").update({
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "telegram_message_id": str(message_id) if message_id else None,
+        }).eq("id", article_id).execute()
+    except Exception as e:
+        print("mark_sent failed:", e)
 
 
 # =====================
@@ -442,6 +486,22 @@ def fetch(query):
         if is_blocked_url(link) or is_blocked_title(title):
             continue
 
+        # ← זיהוי המקור (שם + דומיין) לצורך חסימת אתרי ספורט
+        src_name = ""
+        src_href = ""
+        src = getattr(entry, "source", None)
+        if src is not None:
+            try:
+                src_name = clean(getattr(src, "title", "") or "")
+                src_href = getattr(src, "href", "") or ""
+            except Exception:
+                pass
+        if not src_name:
+            src_name = source_from_title(title)
+
+        if is_sport_source(src_name, src_href):
+            continue
+
         if not is_recent(entry):
             skipped_old += 1
             continue
@@ -452,7 +512,7 @@ def fetch(query):
             "title": title,
             "link": normalize_url(link),
             "published": published,
-            "source": source_from_title(title),
+            "source": src_name or source_from_title(title),
             "query": query
         })
 
@@ -535,6 +595,7 @@ def score(raw):
 
     return {
         "id": uid(raw["title"], raw["link"]),
+        "title_key": title_key(raw["title"]),
         "title": raw["title"],
         "link": raw["link"],
         "source": raw["source"],
@@ -614,14 +675,19 @@ def send_article_with_buttons(item):
 # MESSAGES
 # =====================
 
-def daily_message(conn):
+def daily_message(client):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    rows = conn.execute("""
-        SELECT * FROM articles
-        WHERE first_seen_at >= ?
-        ORDER BY first_seen_at DESC
-        LIMIT 50
-    """, (cutoff,)).fetchall()
+    try:
+        res = (client.table("articles")
+               .select("*")
+               .gte("first_seen_at", cutoff)
+               .order("first_seen_at", desc=True)
+               .limit(50)
+               .execute())
+        rows = res.data or []
+    except Exception as e:
+        print("daily_message query failed:", e)
+        rows = []
 
     total = len(rows)
 
@@ -651,9 +717,11 @@ def daily_message(conn):
 # =====================
 
 def run_hourly():
-    conn = db()
+    client = db()
+    sent_ids, sent_tkeys = load_recent_sent(client)
     candidates = {}
     seen_titles = []
+    seen_tkeys = set()
 
     stats = {
         "scanned": 0,
@@ -684,29 +752,34 @@ def run_hourly():
                 stats["skipped_irrelevant"] += 1
                 continue
 
-            record_found(conn, item)
+            record_found(client, item)
 
-            if already_sent(conn, item["id"]):
+            # כבר נשלח בעבר (נשמר ב-Supabase) — לפי מזהה או לפי כותרת
+            if item["id"] in sent_ids or item["title_key"] in sent_tkeys:
                 stats["skipped_duplicate"] += 1
                 continue
 
-            if is_duplicate_title(item["title"], seen_titles):
+            # כפילות בתוך אותה ריצה
+            if item["title_key"] in seen_tkeys or is_duplicate_title(item["title"], seen_titles):
                 stats["skipped_duplicate"] += 1
                 continue
 
             if item["id"] not in candidates or item["score"] > candidates[item["id"]]["score"]:
                 candidates[item["id"]] = item
                 seen_titles.append(item["title"])
+                seen_tkeys.add(item["title_key"])
 
         time.sleep(0.12)
 
     selected = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:MAX_ITEMS_PER_RUN]
     stats["sent"] = len(selected)
 
-    # ← חדש: שולח כל כתבה בנפרד עם כפתורים, במקום הודעה מרוכזת
+    # ← שולח כל כתבה בנפרד עם כפתורים, ומסמן מיד כ'נשלחה'
     for item in selected:
         message_id = send_article_with_buttons(item)
-        mark_sent(conn, item["id"], message_id)
+        mark_sent(client, item["id"], message_id)
+        sent_ids.add(item["id"])
+        sent_tkeys.add(item["title_key"])
         time.sleep(0.4)
 
     if not selected and SEND_EMPTY_REPORT:
@@ -723,8 +796,8 @@ def run_hourly():
     print("=" * 40)
 
 def run_daily():
-    conn = db()
-    send_telegram(daily_message(conn))
+    client = db()
+    send_telegram(daily_message(client))
     print("Daily sent")
 
 def run_test():
