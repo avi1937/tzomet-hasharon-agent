@@ -35,8 +35,8 @@ MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "20"))
 MAX_QUERIES_PER_RUN = int(os.getenv("MAX_QUERIES_PER_RUN", "200"))
 GOOGLE_NEWS_DAYS_BACK = int(os.getenv("GOOGLE_NEWS_DAYS_BACK", "2"))
 SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+SUPABASE_URL = re.sub(r"\s+", "", os.getenv("SUPABASE_URL", ""))
+SUPABASE_KEY = re.sub(r"\s+", "", os.getenv("SUPABASE_KEY", ""))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
 MIN_LOCAL_HITS = int(os.getenv("MIN_LOCAL_HITS", "4"))
 
