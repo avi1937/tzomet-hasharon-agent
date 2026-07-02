@@ -21,7 +21,6 @@ from urllib.parse import quote_plus, urlparse, urlencode, parse_qs, urlunparse
 
 import feedparser
 import requests
-from supabase import create_client, Client
 
 
 # =====================
@@ -378,76 +377,92 @@ def is_recent(entry, hours=None):
 # DATABASE (Supabase)
 # =====================
 
-_sb_client = None
+# =====================
+# DATABASE (Supabase דרך REST ישיר — HTTP/1.1, יציב)
+# =====================
+# הערה: אנחנו לא משתמשים בספריית supabase-py כי היא פותחת חיבור HTTP/2
+# שסביבת Render מפילה (StreamReset). במקום זה קוראים ישירות ל-PostgREST
+# עם requests (HTTP/1.1) — יציב לגמרי.
 
-def db():
-    """מחזיר חיבור ל-Supabase (נשמר בין קריאות)."""
-    global _sb_client
-    if _sb_client is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _sb_client
+def _sb_headers(extra=None):
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Connection": "close",  # לא לשמור חיבור פתוח — מונע נפילות
+    }
+    if extra:
+        h.update(extra)
+    return h
 
-def _reset_client():
-    """סוגר ומאפס את החיבור ל-Supabase, כדי שהקריאה הבאה תפתח חיבור טרי."""
-    global _sb_client
-    _sb_client = None
-    return db()
+def _sb_url(path):
+    base = SUPABASE_URL.rstrip("/")
+    return f"{base}/rest/v1/{path}"
 
-def _retry(action, what, attempts=4):
-    """
-    מריץ פעולה מול Supabase עם ניסיונות חוזרים.
-    אם החיבור נופל (StreamReset / ConnectionTerminated) — פותח חיבור חדש ומנסה שוב.
-    action מקבל client ומחזיר תוצאה.
-    """
-    client = db()
+def _sb_request(method, path, what, params=None, json_body=None, headers=None, attempts=4):
+    """קריאת REST ל-Supabase עם ניסיונות חוזרים. מחזיר Response או None."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
     delay = 0.5
     for i in range(attempts):
         try:
-            return action(client)
+            resp = requests.request(
+                method,
+                _sb_url(path),
+                headers=_sb_headers(headers),
+                params=params,
+                json=json_body,
+                timeout=30,
+            )
+            if resp.status_code >= 400:
+                # שגיאת שרת/נתונים — לא ננסה שוב סתם, נדפיס ונחזיר
+                print(f"{what} HTTP {resp.status_code}:", resp.text[:300])
+                if resp.status_code in (500, 502, 503, 504) and i < attempts - 1:
+                    time.sleep(delay); delay = min(delay * 2, 4); continue
+                return None
+            return resp
         except Exception as e:
             msg = str(e)
-            is_conn = ("StreamReset" in msg or "ConnectionTerminated" in msg
-                       or "Server disconnected" in msg or "RemoteProtocolError" in msg
-                       or "ConnectionError" in msg or "timed out" in msg.lower())
             if i == attempts - 1:
                 print(f"{what} failed (after {attempts} tries):", msg)
                 return None
-            if is_conn:
-                # החיבור נפל — נפתח חדש ונשהה מעט
-                time.sleep(delay)
-                client = _reset_client()
-                delay = min(delay * 2, 4)
-            else:
-                # שגיאה אחרת (נתונים וכו') — אין טעם לנסות שוב
-                print(f"{what} failed:", msg)
-                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 4)
     return None
+
+def db():
+    """נשמר לתאימות — כבר לא צריך client אמיתי, אבל קוד ישן קורא לזה."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+    return True
 
 def load_recent_sent(client=None, days=4):
     """טוען מ-Supabase את כל מה שכבר נשלח בימים האחרונים, כדי למנוע כפילויות."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     sent_ids, sent_tkeys = set(), set()
 
-    def _do(c):
-        return (c.table("articles")
-                .select("id,title_key,sent_at")
-                .gte("first_seen_at", cutoff)
-                .execute())
-
-    res = _retry(_do, "load_recent_sent")
-    for row in ((res.data if res else None) or []):
-        if row.get("sent_at"):
-            if row.get("id"):
-                sent_ids.add(row["id"])
-            if row.get("title_key"):
-                sent_tkeys.add(row["title_key"])
+    resp = _sb_request(
+        "GET", "articles", "load_recent_sent",
+        params={
+            "select": "id,title_key,sent_at",
+            "first_seen_at": f"gte.{cutoff}",
+            "sent_at": "not.is.null",
+        },
+    )
+    if resp is not None:
+        try:
+            for row in resp.json():
+                if row.get("sent_at"):
+                    if row.get("id"):
+                        sent_ids.add(row["id"])
+                    if row.get("title_key"):
+                        sent_tkeys.add(row["title_key"])
+        except Exception as e:
+            print("load_recent_sent parse failed:", e)
     return sent_ids, sent_tkeys
 
-def record_found(client, item):
-    """שומר ידיעה שנמצאה. אם היא כבר קיימת — לא דורס (ignore_duplicates)."""
-    payload = {
+def _row_from_item(item, now):
+    return {
         "id": item["id"],
         "title": item["title"],
         "link": item["link"],
@@ -456,59 +471,47 @@ def record_found(client, item):
         "reasons": json.dumps(item["reasons"], ensure_ascii=False),
         "query": item["query"],
         "title_key": item["title_key"],
-        "first_seen_at": datetime.now(timezone.utc).isoformat(),
+        "first_seen_at": now,
         "status": "pending",
     }
 
-    def _do(c):
-        return (c.table("articles")
-                .upsert(payload, on_conflict="id", ignore_duplicates=True)
-                .execute())
-
-    _retry(_do, "record_found")
+def record_found(client, item):
+    """שומר ידיעה שנמצאה. אם קיימת — מתעלם (ignore duplicates)."""
+    now = datetime.now(timezone.utc).isoformat()
+    _sb_request(
+        "POST", "articles", "record_found",
+        params={"on_conflict": "id"},
+        json_body=_row_from_item(item, now),
+        headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+    )
 
 def record_found_bulk(client, items):
-    """שומר קבוצת ידיעות בבת אחת (בקשה אחת במקום עשרות) — הרבה יותר יציב."""
+    """שומר קבוצת ידיעות בבקשה אחת (יציב ומהיר)."""
     if not items:
         return
     now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for item in items:
-        rows.append({
-            "id": item["id"],
-            "title": item["title"],
-            "link": item["link"],
-            "source": item["source"],
-            "city": item["city"],
-            "reasons": json.dumps(item["reasons"], ensure_ascii=False),
-            "query": item["query"],
-            "title_key": item["title_key"],
-            "first_seen_at": now,
-            "status": "pending",
-        })
-
-    def _do(c):
-        return (c.table("articles")
-                .upsert(rows, on_conflict="id", ignore_duplicates=True)
-                .execute())
-
-    _retry(_do, "record_found_bulk")
+    rows = [_row_from_item(it, now) for it in items]
+    _sb_request(
+        "POST", "articles", "record_found_bulk",
+        params={"on_conflict": "id"},
+        json_body=rows,
+        headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+    )
 
 def mark_sent(client, article_id, message_id=None):
-    """מסמן ידיעה כ'נשלחה' כדי שלא תישלח שוב אף פעם."""
+    """מסמן ידיעה כ'נשלחה' כדי שלא תישלח שוב."""
     payload = {
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "telegram_message_id": str(message_id) if message_id else None,
         "status": "sent",
     }
+    _sb_request(
+        "PATCH", "articles", "mark_sent",
+        params={"id": f"eq.{article_id}"},
+        json_body=payload,
+        headers={"Prefer": "return=minimal"},
+    )
 
-    def _do(c):
-        return (c.table("articles")
-                .update(payload)
-                .eq("id", article_id)
-                .execute())
-
-    _retry(_do, "mark_sent")
 
 
 # =====================
@@ -755,19 +758,24 @@ def send_article_with_buttons(item):
 # MESSAGES
 # =====================
 
-def daily_message(client):
+def daily_message(client=None):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    try:
-        res = (client.table("articles")
-               .select("*")
-               .gte("first_seen_at", cutoff)
-               .order("first_seen_at", desc=True)
-               .limit(50)
-               .execute())
-        rows = res.data or []
-    except Exception as e:
-        print("daily_message query failed:", e)
-        rows = []
+    rows = []
+    resp = _sb_request(
+        "GET", "articles", "daily_message",
+        params={
+            "select": "*",
+            "first_seen_at": f"gte.{cutoff}",
+            "order": "first_seen_at.desc",
+            "limit": "50",
+        },
+    )
+    if resp is not None:
+        try:
+            rows = resp.json() or []
+        except Exception as e:
+            print("daily_message parse failed:", e)
+            rows = []
 
     total = len(rows)
 
